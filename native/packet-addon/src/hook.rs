@@ -762,6 +762,23 @@ mod linux {
         }
     }
 
+    fn mprotect_code_writable(page: usize, original: libc::c_int) -> Result<(), HookError> {
+        // QQ's worker threads can be executing other functions on this page.
+        // Keep every existing permission, especially EXEC, while writing the
+        // jump; changing a live text page to RW can fault those threads. The
+        // caller restores the original protection immediately after the write.
+        if unsafe { libc::mprotect(page as *mut c_void, PAGE_SIZE, original | libc::PROT_WRITE) }
+            != 0
+        {
+            Err(HookError::Create(format!(
+                "mprotect writable code failed errno={}",
+                errno()
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
     fn write_i32(at: *mut u8, value: i32) {
         unsafe { std::ptr::copy_nonoverlapping(value.to_ne_bytes().as_ptr(), at, 4) };
     }
@@ -778,14 +795,14 @@ mod linux {
     fn patch_rel32_jmp(target: usize, stub: usize) -> Result<(), HookError> {
         let page = target & !(PAGE_SIZE - 1);
         let original = prot_of(target).unwrap_or(libc::PROT_READ | libc::PROT_EXEC);
-        mprotect_rw(page, PAGE_SIZE)?;
+        mprotect_code_writable(page, original)?;
         unsafe {
             let at = target as *mut u8;
             *at = 0xE9;
             let rel = (stub as isize).wrapping_sub((target as isize) + 5);
             write_i32(at.add(1), rel as i32);
         }
-        // Restore the original protection (W^X): never leave .text writable.
+        // Only the brief patch window is writable; restore the original .text protection.
         if unsafe { libc::mprotect(page as *mut c_void, PAGE_SIZE, original) } != 0 {
             let _ = unsafe {
                 libc::mprotect(
@@ -801,7 +818,7 @@ mod linux {
     fn unpatch(target: usize) -> Result<(), HookError> {
         let page = target & !(PAGE_SIZE - 1);
         let original = prot_of(target).unwrap_or(libc::PROT_READ | libc::PROT_EXEC);
-        mprotect_rw(page, PAGE_SIZE)?;
+        mprotect_code_writable(page, original)?;
         unsafe { std::ptr::copy_nonoverlapping(PROLOGUE.as_ptr(), target as *mut u8, 5) };
         if unsafe { libc::mprotect(page as *mut c_void, PAGE_SIZE, original) } != 0 {
             let _ = unsafe {
